@@ -1,0 +1,223 @@
+"""
+Knowledge Base Search API for Widget
+Provides semantic search through crawled content for intelligent responses.
+"""
+
+import logging
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, Depends, Query
+from pydantic import BaseModel, Field
+from ...core.auth_middleware import get_current_user
+from ...services.local_storage_manager import LocalStorageManager
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# Initialize storage manager
+storage_manager = LocalStorageManager()
+
+
+class SearchRequest(BaseModel):
+    """Request model for knowledge base search."""
+    query: str = Field(..., description="Search query", min_length=1, max_length=500)
+    website_id: Optional[str] = Field(None, description="Filter by specific website")
+    limit: int = Field(default=5, description="Maximum results", ge=1, le=20)
+
+
+class SearchResult(BaseModel):
+    """Search result model."""
+    page_id: str
+    url: str
+    title: str
+    content_snippet: str
+    similarity_score: float
+    metadata: Dict[str, Any]
+
+
+class SearchResponse(BaseModel):
+    """Response model for search results."""
+    success: bool
+    query: str
+    results: List[SearchResult]
+    total_found: int
+    search_type: str  # "vector" or "text"
+
+
+@router.post("/search")
+async def search_knowledge_base(
+    request: SearchRequest,
+    current_user: dict = Depends(get_current_user)
+) -> SearchResponse:
+    """
+    Search through crawled content for relevant information.
+    Supports both vector similarity search and text search.
+    """
+    try:
+        # Perform search
+        raw_results = await storage_manager.search_content(
+            query=request.query,
+            website_id=request.website_id,
+            limit=request.limit
+        )
+
+        # Format results
+        formatted_results = []
+        for result in raw_results:
+            metadata = result.get('metadata', {})
+
+            formatted_results.append(SearchResult(
+                page_id=result['page_id'],
+                url=metadata.get('url', ''),
+                title=metadata.get('title', 'Untitled'),
+                content_snippet=result['content'][:300] + "..." if len(result['content']) > 300 else result['content'],
+                similarity_score=result.get('similarity_score', 0.0),
+                metadata=metadata
+            ))
+
+        # Determine search type
+        search_type = "vector" if storage_manager.vector_client else "text"
+
+        return SearchResponse(
+            success=True,
+            query=request.query,
+            results=formatted_results,
+            total_found=len(formatted_results),
+            search_type=search_type
+        )
+
+    except Exception as e:
+        logger.error(f"Knowledge base search failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+
+@router.get("/search")
+async def search_knowledge_base_get(
+    q: str = Query(..., description="Search query"),
+    website_id: Optional[str] = Query(None, description="Filter by website"),
+    limit: int = Query(5, description="Max results", ge=1, le=20),
+    current_user: dict = Depends(get_current_user)
+) -> SearchResponse:
+    """
+    GET endpoint for knowledge base search (for simple widget integration).
+    """
+    request = SearchRequest(query=q, website_id=website_id, limit=limit)
+    return await search_knowledge_base(request, current_user)
+
+
+@router.get("/stats")
+async def get_knowledge_base_stats(
+    current_user: dict = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """
+    Get knowledge base statistics.
+    """
+    try:
+        stats = storage_manager.get_storage_stats()
+        return {
+            "success": True,
+            "data": stats
+        }
+    except Exception as e:
+        logger.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get statistics")
+
+
+@router.post("/suggest")
+async def suggest_responses(
+    request: SearchRequest,
+    current_user: dict = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """
+    Generate suggested responses based on crawled content.
+    This is a simplified version without LLM integration.
+    """
+    try:
+        # Search for relevant content
+        search_results = await storage_manager.search_content(
+            query=request.query,
+            website_id=request.website_id,
+            limit=3
+        )
+
+        if not search_results:
+            return {
+                "success": True,
+                "suggestions": [
+                    "I don't have specific information about that topic in my knowledge base.",
+                    "Let me help you find the right information. Could you provide more details?",
+                    "You might want to check our main website for more detailed information."
+                ]
+            }
+
+        # Create simple suggestions based on found content
+        suggestions = []
+        for result in search_results[:2]:
+            content = result['content'][:200]
+            metadata = result.get('metadata', {})
+            url = metadata.get('url', '')
+
+            suggestion = f"Based on the information I have: {content}"
+            if url:
+                suggestion += f" You can find more details at: {url}"
+
+            suggestions.append(suggestion)
+
+        # Add a general helpful response
+        suggestions.append(
+            "Is there anything specific about this topic you'd like me to help you with?"
+        )
+
+        return {
+            "success": True,
+            "suggestions": suggestions,
+            "source_count": len(search_results)
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to generate suggestions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate suggestions")
+
+
+# Widget integration endpoints
+@router.get("/widget/search/{website_id}")
+async def widget_search(
+    website_id: str,
+    q: str = Query(..., description="Search query"),
+    limit: int = Query(3, description="Max results", ge=1, le=10)
+) -> Dict[str, Any]:
+    """
+    Simplified search endpoint for widget integration.
+    No authentication required for public widgets.
+    """
+    try:
+        results = await storage_manager.search_content(
+            query=q,
+            website_id=website_id,
+            limit=limit
+        )
+
+        # Format for widget
+        widget_results = []
+        for result in results:
+            metadata = result.get('metadata', {})
+            widget_results.append({
+                'title': metadata.get('title', 'Untitled'),
+                'url': metadata.get('url', ''),
+                'snippet': result['content'][:150] + "..." if len(result['content']) > 150 else result['content'],
+                'score': round(result.get('similarity_score', 0.0), 2)
+            })
+
+        return {
+            "success": True,
+            "results": widget_results,
+            "total": len(widget_results)
+        }
+
+    except Exception as e:
+        logger.error(f"Widget search failed: {e}")
+        return {
+            "success": False,
+            "results": [],
+            "total": 0,
+            "error": "Search temporarily unavailable"
+        }

@@ -1,0 +1,201 @@
+"""
+RAG-enhanced chat service that uses scraped website content as context for AI responses.
+"""
+
+import asyncio
+import logging
+from typing import Dict, Any, Optional, List
+from uuid import UUID
+from openai import AsyncOpenAI
+
+from ..core.config import get_settings
+from .vector_search_service import VectorSearchService
+from .local_storage_manager import LocalStorageManager
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+class RAGChatService:
+    """Chat service with Retrieval Augmented Generation (RAG) capabilities."""
+    
+    def __init__(self):
+        self.vector_service = VectorSearchService()
+        self.storage_manager = LocalStorageManager()
+        self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if hasattr(settings, 'openai_api_key') else None
+        
+    async def generate_rag_response(
+        self, 
+        user_message: str, 
+        website_id: UUID,
+        conversation_history: Optional[List[Dict[str, str]]] = None
+    ) -> Dict[str, Any]:
+        """Generate AI response using website content as context."""
+        try:
+            # Try local storage first for fast semantic search
+            local_context = []
+            try:
+                local_results = await self.storage_manager.search_content(
+                    query=user_message,
+                    website_id=str(website_id),
+                    limit=3
+                )
+                for result in local_results:
+                    metadata = result.get('metadata', {})
+                    local_context.append({
+                        'content': result['content'][:500],  # Limit content length
+                        'url': metadata.get('url', ''),
+                        'title': metadata.get('title', 'Untitled'),
+                        'score': result.get('similarity_score', 0)
+                    })
+                logger.info(f"Found {len(local_context)} results from local storage")
+            except Exception as e:
+                logger.warning(f"Local storage search failed: {e}")
+
+            # Get relevant context from scraped content (improved schema as fallback)
+            context = await self.vector_service.get_context_for_query_improved(user_message, website_id, limit=3)
+
+            # Combine local and vector search results
+            if local_context:
+                # Prioritize local storage results
+                context = local_context + (context[:2] if context else [])
+            
+            # Build the system prompt with context
+            system_prompt = self._build_system_prompt(context)
+            
+            # Prepare conversation history
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Add conversation history if provided
+            if conversation_history:
+                messages.extend(conversation_history[-6:])  # Keep last 6 messages for context
+            
+            # Add current user message
+            messages.append({"role": "user", "content": user_message})
+            
+            # Generate AI response
+            if self.openai_client:
+                ai_response = await self._generate_openai_response(messages)
+            else:
+                ai_response = self._generate_fallback_response(user_message, context)
+            
+            return {
+                "response": ai_response,
+                "context_used": bool(context),
+                "context_preview": context[:200] + "..." if len(context) > 200 else context,
+                "source": "openai" if self.openai_client else "fallback"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating RAG response: {e}")
+            return {
+                "response": "I apologize, but I'm having trouble processing your request right now. Please try again.",
+                "context_used": False,
+                "context_preview": "",
+                "source": "error"
+            }
+    
+    def _build_system_prompt(self, context: str) -> str:
+        """Build system prompt with website context."""
+        base_prompt = """You are a humble and knowledgeable website assistant. I'm here to help visitors find information about this specific website and its offerings.
+
+My approach:
+- I focus specifically on this website's content, services, and information
+- I provide accurate, helpful responses based on the website's actual content
+- When I don't have specific information, I'll honestly say so and guide visitors to where they might find answers
+- I avoid generic responses and instead provide website-specific, personalized help
+- I'm concise but thorough, making sure visitors get exactly what they need
+- I acknowledge the limits of my knowledge and suggest contacting the website directly when appropriate
+
+Communication style:
+- Humble and approachable - I'm here to assist, not impress
+- Direct and helpful - I get to the point while being friendly
+- Website-focused - Everything I share relates specifically to this site
+- Honest about limitations - I won't make up information I don't have"""
+
+        if context:
+            return f"""{base_prompt}
+
+Here's the relevant information from this website that I can draw from:
+{context}
+
+I'll use this specific content to provide accurate, helpful answers about this website. If your question goes beyond what's covered here, I'll let you know and suggest how you might find more information."""
+        else:
+            return f"""{base_prompt}
+
+I notice I don't have access to this website's specific content right now. I'll still try to help where I can, but for the most accurate information about this website's services, products, or details, I'd recommend:
+- Exploring the website's main navigation and pages
+- Checking their FAQ or Help section
+- Contacting them directly through their contact information
+
+How can I assist you today?"""
+    
+    async def _generate_openai_response(self, messages: List[Dict[str, str]]) -> str:
+        """Generate response using OpenAI API."""
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",  # More capable model for better understanding
+                messages=messages,
+                max_tokens=800,  # Increased for more detailed, helpful responses
+                temperature=0.3,  # Lower temperature for more focused, accurate responses
+                top_p=0.9,  # Slightly more focused token selection
+                frequency_penalty=0.1,  # Slight penalty to reduce repetition
+                presence_penalty=0.1   # Encourage more diverse content
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"Error generating OpenAI response: {e}")
+            return "I apologize, but I'm experiencing technical difficulties. Please try again later."
+    
+    def _generate_fallback_response(self, user_message: str, context: str) -> str:
+        """Generate a simple rule-based response when OpenAI is not available."""
+        user_message_lower = user_message.lower()
+        
+        # If we have context, try to use it
+        if context:
+            if any(word in user_message_lower for word in ['what', 'about', 'tell me']):
+                return f"Based on the website content, here's what I found: {context[:300]}..."
+            elif any(word in user_message_lower for word in ['how', 'when', 'where']):
+                return f"According to the website information: {context[:200]}... Would you like more specific details?"
+            else:
+                return f"I found some relevant information on the website: {context[:250]}..."
+        
+        # Fallback responses without context
+        if any(word in user_message_lower for word in ['hello', 'hi', 'hey']):
+            return "Hello! I'm here to help you with questions about this website. What would you like to know?"
+        elif any(word in user_message_lower for word in ['help', 'support']):
+            return "I'm here to help! You can ask me questions about the website's content, services, or information. What specific topic are you interested in?"
+        elif any(word in user_message_lower for word in ['contact', 'reach', 'phone', 'email']):
+            return "For contact information, please check the website's contact or about page. Is there anything specific you'd like to know?"
+        else:
+            return "Thank you for your question. While I don't have specific information about that topic right now, I'd be happy to help with other questions about the website."
+    
+    async def get_conversation_summary(self, messages: List[Dict[str, str]]) -> str:
+        """Generate a summary of the conversation for context."""
+        if not messages or len(messages) < 2:
+            return ""
+        
+        try:
+            # Simple summary - take key points from recent messages
+            recent_messages = messages[-4:]  # Last 4 messages
+            summary_parts = []
+            
+            for msg in recent_messages:
+                if msg.get('role') == 'user':
+                    # Extract key topics from user messages
+                    content = msg.get('content', '')[:100]
+                    if content:
+                        summary_parts.append(f"User asked: {content}")
+                elif msg.get('role') == 'assistant':
+                    # Extract key points from assistant responses
+                    content = msg.get('content', '')[:100]
+                    if content:
+                        summary_parts.append(f"Assistant replied: {content}")
+            
+            return " | ".join(summary_parts)
+            
+        except Exception as e:
+            logger.error(f"Error generating conversation summary: {e}")
+            return ""
