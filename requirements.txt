@@ -16,6 +16,7 @@ tiktoken>=0.5.0
 # Database and storage
 supabase==2.0.1
 redis==4.6.0
+sqlalchemy==2.0.23
 
 # Background tasks (Celery for task queue)
 celery[redis]==5.3.4
