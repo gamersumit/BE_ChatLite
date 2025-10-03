@@ -117,6 +117,18 @@ async def register_website(
                 detail="Failed to register website"
             )
 
+        # Trigger screenshot capture task (async, don't wait for it)
+        try:
+            from app.core.celery_config import celery_app
+            celery_app.send_task(
+                'crawler.tasks.capture_screenshot',
+                args=[website_id, website_data.url]
+            )
+            print(f"Screenshot capture task triggered for website {website_id}")
+        except Exception as e:
+            # Don't fail registration if screenshot task fails to trigger
+            print(f"Failed to trigger screenshot task: {e}")
+
     except Exception as e:
         error_message = str(e)
         # Check for duplicate key violation

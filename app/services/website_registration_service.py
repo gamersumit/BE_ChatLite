@@ -209,7 +209,19 @@ class WebsiteRegistrationService:
             
             db.add(user_website)
             await db.commit()
-            
+
+            # Trigger screenshot capture task (async, don't wait for it)
+            try:
+                from app.core.celery_config import celery_app
+                celery_app.send_task(
+                    'crawler.tasks.capture_screenshot',
+                    args=[website.id, normalized_url]
+                )
+                logger.info(f"Screenshot capture task triggered for website {website.id}")
+            except Exception as e:
+                # Don't fail registration if screenshot task fails to trigger
+                logger.error(f"Failed to trigger screenshot task: {e}")
+
             return {
                 "success": True,
                 "website": {

@@ -36,6 +36,9 @@ class Website(Base):
     verification_status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False)
     last_crawled: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Screenshot URL (stored in Cloudinary)
+    screenshot_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
     # Usage tracking
     total_conversations: Mapped[int] = mapped_column(Integer, default=0)
     total_messages: Mapped[int] = mapped_column(Integer, default=0)

@@ -34,6 +34,7 @@ def get_celery_config() -> Dict[str, Any]:
             'crawler.tasks.schedule_crawl': {'queue': 'schedule_queue'},
             'crawler.tasks.generate_embeddings': {'queue': 'process_queue'},
             'crawler.tasks.update_knowledge_base': {'queue': 'process_queue'},
+            'crawler.tasks.capture_screenshot': {'queue': 'crawl_queue'},
             'monitor.tasks.*': {'queue': 'monitor_queue'},
         },
 

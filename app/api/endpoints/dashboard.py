@@ -110,7 +110,8 @@ async def get_websites(
                 "totalPages": website_crawl_pages.get(site['id'], 0),
                 "monthlyChats": monthly_chats,
                 # "responseRate": 92.5,  # Removed hardcoded value - will calculate from actual data later
-                "widgetId": full_site.get('widget_id')
+                "widgetId": full_site.get('widget_id'),
+                "screenshot_url": full_site.get('screenshot_url')
             })
 
         # Calculate total pages for pagination

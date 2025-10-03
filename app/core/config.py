@@ -77,6 +77,11 @@ class Settings(BaseSettings):
     celery_broker_url: str = Field(default="redis://localhost:6379/0", description="Celery broker URL")
     celery_result_backend: str = Field(default="redis://localhost:6379/0", description="Celery result backend URL")
 
+    # Cloudinary Configuration (for screenshot storage)
+    cloudinary_cloud_name: str = Field(description="Cloudinary cloud name")
+    cloudinary_api_key: str = Field(description="Cloudinary API key")
+    cloudinary_api_secret: str = Field(description="Cloudinary API secret")
+
     # API Configuration
     api_base_url: str = Field(default="http://localhost:8001", description="API base URL")
     api_port: int = Field(default=8001, description="API port")

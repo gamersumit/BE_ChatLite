@@ -106,3 +106,80 @@ async def activate_website(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error activating website: {str(e)}"
         )
+
+
+class ScreenshotUploadRequest(BaseModel):
+    """Request model for screenshot upload."""
+    screenshot_base64: str
+
+
+class ScreenshotUploadResponse(BaseModel):
+    """Response model for screenshot upload."""
+    success: bool
+    screenshot_url: str = None
+    message: str = None
+
+
+@router.post("/{website_id}/screenshot", response_model=ScreenshotUploadResponse)
+async def upload_website_screenshot(
+    website_id: str,
+    request: ScreenshotUploadRequest,
+    supabase: Client = Depends(get_supabase_admin_client)
+):
+    """
+    Upload website screenshot to Cloudinary and update database.
+    This endpoint is called by the Celery worker after capturing a screenshot.
+    """
+    try:
+        from app.services.cloudinary_service import CloudinaryService
+
+        # Get website from database
+        website_result = supabase.table('websites').select('*').eq('id', website_id).execute()
+
+        if not website_result.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Website not found"
+            )
+
+        website = website_result.data[0]
+        domain = website['domain']
+
+        # Upload to Cloudinary
+        cloudinary_service = CloudinaryService()
+        screenshot_url = cloudinary_service.upload_screenshot(
+            screenshot_base64=request.screenshot_base64,
+            website_domain=domain,
+            website_id=website_id
+        )
+
+        if not screenshot_url:
+            return ScreenshotUploadResponse(
+                success=False,
+                message="Failed to upload screenshot to Cloudinary"
+            )
+
+        # Update website with screenshot URL
+        update_result = supabase.table('websites').update({
+            'screenshot_url': screenshot_url
+        }).eq('id', website_id).execute()
+
+        if update_result.data:
+            return ScreenshotUploadResponse(
+                success=True,
+                screenshot_url=screenshot_url,
+                message="Screenshot uploaded successfully"
+            )
+        else:
+            return ScreenshotUploadResponse(
+                success=False,
+                message="Failed to update website with screenshot URL"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error uploading screenshot: {str(e)}"
+        )
