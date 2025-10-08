@@ -28,8 +28,8 @@ def trigger_website_crawl(
     website_url: str,
     user_id: Optional[str],
     job_type: str = "verification_crawl",
-    max_pages: int = 25,
-    max_depth: int = 3
+    max_pages: int = 100,  # Hardcoded
+    max_depth: int = 2     # Hardcoded
 ) -> Optional[str]:
     """
     Shared function to trigger a website crawl.
@@ -46,46 +46,55 @@ def trigger_website_crawl(
         Job ID if successful, None if failed
     """
     try:
-        from ...tasks.crawler_tasks import crawl_url
         from ...core.supabase_client import get_supabase_admin
+        from ...core.celery_client import get_celery_app
 
         logger.info(f"🚀 Triggering {job_type} for website {website_id}, URL: {website_url}")
 
-        # Get fresh supabase client in background task
+        # Get fresh supabase client
         supabase = get_supabase_admin()
 
-        # Create crawl job in crawling_jobs table
+        # Create crawl job in crawling_jobs table with new streaming schema
         crawl_job_id = str(uuid.uuid4())
         crawl_job = {
             'id': crawl_job_id,
             'website_id': website_id,
-            'user_id': user_id,
-            'job_type': job_type,
-            'status': 'pending',
             'config': {
+                'url': website_url,
                 'max_pages': max_pages,
-                'max_depth': max_depth,
-                'url': website_url
+                'max_depth': max_depth
             },
+            'max_pages': max_pages,
+            'max_depth': max_depth,
+            'status': 'pending',
+            'pages_queued': 0,
+            'pages_processing': 0,
+            'pages_completed': 0,
+            'pages_failed': 0,
             'created_at': datetime.now(timezone.utc).isoformat()
         }
 
-        logger.info(f"📝 Creating crawl job {crawl_job_id} in database")
+        logger.info(f"📝 Creating streaming crawl job {crawl_job_id} in database")
         # Insert crawl job
         job_result = supabase.table('crawling_jobs').insert(crawl_job).execute()
         if not job_result.data:
             raise Exception("Failed to create crawl job in database")
 
-        logger.info(f"📤 Dispatching Celery task for job {crawl_job_id}")
-        # Start background crawl using Celery
-        task = crawl_url.delay(
-            job_id=crawl_job_id,
-            website_id=website_id,
-            url=website_url,
-            max_pages=max_pages,
-            max_depth=max_depth
+        logger.info(f"📤 Dispatching streaming Celery task for job {crawl_job_id}")
+        # Start background crawl using NEW streaming crawler
+        celery_app = get_celery_app()
+        task = celery_app.send_task(
+            'crawler.tasks.crawl_url_streaming',
+            args=[crawl_job_id, website_id, website_url, max_pages, max_depth],
+            queue='crawl_queue'
         )
-        logger.info(f"✅ Successfully dispatched {job_type} for website {website_id}, job_id: {crawl_job_id}, celery_task_id: {task.id}")
+
+        # Update job with Celery task ID
+        supabase.table('crawling_jobs').update({
+            'celery_task_id': task.id
+        }).eq('id', crawl_job_id).execute()
+
+        logger.info(f"✅ Successfully dispatched streaming {job_type} for website {website_id}, job_id: {crawl_job_id}, celery_task_id: {task.id}")
         return crawl_job_id
 
     except Exception as e:

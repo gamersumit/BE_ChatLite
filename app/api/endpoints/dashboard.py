@@ -57,47 +57,70 @@ async def get_websites(
             conversations_result = supabase.table('conversations').select('id', count='exact').in_('website_id', website_ids).execute()
             total_conversations_count = conversations_result.count or 0
 
-            # Get the latest successful crawl job for each website to calculate pages and last crawled time
-            website_last_crawled = {}  # Store last crawled time for each website
-            for website_id in website_ids:
-                crawl_jobs_result = supabase.table('crawling_jobs')\
-                    .select('crawl_metrics, completed_at')\
-                    .eq('website_id', website_id)\
-                    .eq('status', 'completed')\
-                    .order('completed_at', desc=True)\
-                    .limit(1)\
-                    .execute()
+            # OPTIMIZED: Get latest successful crawl for ALL websites in one query
+            # Then group by website_id in Python to find the most recent per website
+            website_last_crawled = {}
+            all_crawls = supabase.table('crawling_jobs')\
+                .select('website_id, crawl_metrics, completed_at')\
+                .in_('website_id', website_ids)\
+                .eq('status', 'completed')\
+                .order('completed_at', desc=True)\
+                .execute()
 
-                if crawl_jobs_result.data:
-                    crawl_data = crawl_jobs_result.data[0]
-                    crawl_metrics = crawl_data.get('crawl_metrics', {})
+            # Group by website_id and keep only the most recent
+            for crawl in all_crawls.data or []:
+                website_id = crawl['website_id']
+                # Only process if we haven't seen this website yet (since sorted by completed_at desc)
+                if website_id not in website_last_crawled:
+                    crawl_metrics = crawl.get('crawl_metrics', {})
                     pages_crawled = crawl_metrics.get('pages_crawled', 0)
-                    completed_at = crawl_data.get('completed_at')
+                    completed_at = crawl.get('completed_at')
 
                     website_crawl_pages[website_id] = pages_crawled
                     website_last_crawled[website_id] = completed_at
                     total_pages_crawled += pages_crawled
-                else:
+
+            # Set defaults for websites without completed crawls
+            for website_id in website_ids:
+                if website_id not in website_crawl_pages:
                     website_crawl_pages[website_id] = 0
                     website_last_crawled[website_id] = None
 
         # Query 2: Get paginated websites for list display
         offset = (page - 1) * limit
-        paginated_websites = user_websites_all[offset:offset + limit]
 
-        # Get detailed data for paginated websites
+        # OPTIMIZED: Get full website data in one query instead of selecting id first then querying again
+        paginated_websites_result = supabase.table('websites')\
+            .select('*')\
+            .eq('user_id', user_id)\
+            .order('created_at', desc=True)\
+            .range(offset, offset + limit - 1)\
+            .execute()
+
+        paginated_websites = paginated_websites_result.data or []
+
+        # OPTIMIZED: Get conversation counts for paginated websites in bulk
+        paginated_website_ids = [w['id'] for w in paginated_websites]
+        website_chat_counts = {}
+
+        if paginated_website_ids:
+            # Get all conversations for paginated websites
+            conversations_by_site = supabase.table('conversations')\
+                .select('website_id')\
+                .in_('website_id', paginated_website_ids)\
+                .execute()
+
+            # Count conversations per website
+            from collections import defaultdict
+            chat_counts = defaultdict(int)
+            for conv in conversations_by_site.data or []:
+                chat_counts[conv['website_id']] += 1
+            website_chat_counts = dict(chat_counts)
+
+        # Build websites list
         websites = []
-        paginated_chats_count = 0
-
-        for site in paginated_websites:
-            # Get conversation count for this specific website
-            conv_result = supabase.table('conversations').select('id', count='exact').eq('website_id', site['id']).execute()
-            monthly_chats = conv_result.count or 0
-            paginated_chats_count += monthly_chats
-
-            # Get full website data for this paginated item
-            full_site_result = supabase.table('websites').select('*').eq('id', site['id']).execute()
-            full_site = full_site_result.data[0] if full_site_result.data else site
+        for full_site in paginated_websites:
+            monthly_chats = website_chat_counts.get(full_site['id'], 0)
 
             websites.append({
                 "id": full_site['id'],
@@ -106,10 +129,9 @@ async def get_websites(
                 "url": full_site.get('url', f"https://{full_site.get('domain', '')}"),
                 "status": "active" if full_site.get('is_active', True) else "inactive",
                 "createdAt": full_site.get('created_at', ''),
-                "lastCrawled": website_last_crawled.get(site['id']),  # Only show actual crawl dates, not fallback dates
-                "totalPages": website_crawl_pages.get(site['id'], 0),
+                "lastCrawled": website_last_crawled.get(full_site['id']),
+                "totalPages": website_crawl_pages.get(full_site['id'], 0),
                 "monthlyChats": monthly_chats,
-                # "responseRate": 92.5,  # Removed hardcoded value - will calculate from actual data later
                 "widgetId": full_site.get('widget_id'),
                 "screenshot_url": full_site.get('screenshot_url')
             })

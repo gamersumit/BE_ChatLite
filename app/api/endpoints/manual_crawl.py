@@ -146,37 +146,8 @@ async def trigger_manual_crawl(
 
         base_url = website.get('website_url') or website.get('url')
 
-        # Find or create corresponding scraped_website entry
-        scraped_website_result = supabase.table('scraped_websites').select('*').eq(
-            'website_id', request.website_id
-        ).execute()
-
-        if scraped_website_result.data:
-            scraped_website_id = scraped_website_result.data[0]['id']
-        else:
-            # Create a new scraped_website entry
-            from urllib.parse import urlparse
-            domain = urlparse(base_url).netloc
-
-            new_scraped_website = {
-                "id": str(uuid.uuid4()),
-                "website_id": request.website_id,
-                "domain": domain,
-                "base_url": base_url,
-                "crawl_status": "pending",
-                "total_pages_found": 0,
-                "pages_processed": 0,
-                "crawl_depth": request.max_depth,
-                "max_pages": request.max_pages
-            }
-
-            scraped_result = supabase.table('scraped_websites').insert(new_scraped_website).execute()
-            if scraped_result.data:
-                scraped_website_id = scraped_result.data[0]['id']
-            else:
-                raise HTTPException(status_code=500, detail="Failed to create scraped website entry")
-
         # Check for existing running crawls to prevent concurrent crawls
+        # Note: scraped_website entry will be created by the Celery task
         existing_jobs = supabase.table('crawling_jobs').select('id, status').eq(
             'website_id', request.website_id
         ).in_('status', ['pending', 'queued', 'running']).execute()
@@ -191,18 +162,28 @@ async def trigger_manual_crawl(
                 }
             )
 
-        # Create crawl job in crawling_jobs table
+        # Create crawl job in crawling_jobs table with streaming schema
+        # Hardcoded limits for now
+        HARDCODED_MAX_PAGES = 100
+        HARDCODED_MAX_DEPTH = 2
+
         crawl_job_id = str(uuid.uuid4())
         crawl_job = {
             'id': crawl_job_id,
             'website_id': request.website_id,
             'user_id': current_user["id"],
             'job_type': 'manual_crawl',
+            'max_pages': HARDCODED_MAX_PAGES,
+            'max_depth': HARDCODED_MAX_DEPTH,
             'status': 'pending',
+            'pages_queued': 0,
+            'pages_processing': 0,
+            'pages_completed': 0,
+            'pages_failed': 0,
             'config': {
-                'max_pages': request.max_pages,
-                'max_depth': request.max_depth,
-                'url': base_url
+                'url': base_url,
+                'max_pages': HARDCODED_MAX_PAGES,
+                'max_depth': HARDCODED_MAX_DEPTH
             },
             'created_at': datetime.now(timezone.utc).isoformat()
         }
@@ -212,17 +193,21 @@ async def trigger_manual_crawl(
         if not job_result.data:
             raise HTTPException(status_code=500, detail="Failed to create crawl job")
 
-        # Use Celery for reliable task execution
-        from ...tasks.crawler_tasks import crawl_url
+        # Use NEW streaming crawler via Celery
+        from ...core.celery_client import get_celery_app
 
-        # Dispatch to Celery worker
-        task = crawl_url.delay(
-            job_id=crawl_job_id,
-            website_id=request.website_id,
-            url=base_url,
-            max_pages=request.max_pages,
-            max_depth=request.max_depth
+        # Dispatch to Celery worker with streaming crawler task
+        celery_app = get_celery_app()
+        task = celery_app.send_task(
+            'crawler.tasks.crawl_url_streaming',
+            args=[crawl_job_id, request.website_id, base_url, HARDCODED_MAX_PAGES, HARDCODED_MAX_DEPTH],
+            queue='crawl_queue'
         )
+
+        # Update job with Celery task ID
+        supabase.table('crawling_jobs').update({
+            'celery_task_id': task.id
+        }).eq('id', crawl_job_id).execute()
 
         execution_method = "celery"
         task_id = task.id
@@ -508,12 +493,20 @@ async def get_website_crawl_history(
 
             for record in crawl_records:
                 try:
+                    # Use pages_completed from database (updated by triggers) instead of crawl_metrics
+                    # This ensures we show the actual crawled page count, not the final task return value
+                    pages_crawled = record.get('pages_completed', 0)
+
+                    # Fallback to crawl_metrics if pages_completed is not available
+                    if pages_crawled == 0 and record.get('crawl_metrics'):
+                        pages_crawled = record.get('crawl_metrics', {}).get('pages_processed', 0)
+
                     history_entry = {
                         "crawl_id": record['id'],
                         "started_at": record.get('started_at') or record.get('created_at'),
                         "completed_at": record.get('completed_at'),
                         "status": record.get('status', 'unknown'),
-                        "pages_crawled": record.get('crawl_metrics', {}).get('pages_processed', 0) if record.get('crawl_metrics') else 0,
+                        "pages_crawled": pages_crawled,
                         "trigger_type": record.get('job_type', '').replace('_crawl', ''),
                         "error_message": record.get('error_message')
                     }
@@ -676,6 +669,10 @@ async def update_job_status(request: UpdateJobStatusRequest):
 
         if request.status == 'running':
             update_data['started_at'] = datetime.now(timezone.utc).isoformat()
+            # Clear completed_at when restarting/retrying a job
+            # Supabase filters out None values, so we need to make a separate update
+            # to explicitly set the field to null
+            pass  # Will handle in separate update below
 
         if request.crawl_metrics:
             update_data['crawl_metrics'] = request.crawl_metrics
@@ -683,10 +680,48 @@ async def update_job_status(request: UpdateJobStatusRequest):
         if request.error_message:
             update_data['error_message'] = request.error_message
 
-        result = supabase.table('crawling_jobs').update(update_data).eq('id', request.job_id).execute()
+        logger.info(f"🔄 BACKEND: Updating job {request.job_id} with data: {update_data}")
+
+        # If status is 'running', we need to clear completed_at
+        # Supabase Python client filters out None values, so we do TWO updates:
+        # 1. First update with the main data
+        # 2. Second update to explicitly clear completed_at
+        if request.status == 'running':
+            # First, update status and started_at
+            result = supabase.table('crawling_jobs').update(update_data).eq('id', request.job_id).execute()
+            logger.info(f"   ✅ Updated status and started_at")
+
+            # Then, clear completed_at by updating with explicit null
+            # Supabase Python client filters out None, so use direct HTTP API
+            import httpx
+            from app.core.config import settings
+
+            # Get Supabase credentials
+            headers = {
+                'apikey': settings.supabase_service_role_key,
+                'Authorization': f'Bearer {settings.supabase_service_role_key}',
+                'Content-Type': 'application/json',
+                'Prefer': 'return=representation'
+            }
+            patch_data = {'completed_at': None}
+            url = f"{settings.supabase_url}/rest/v1/crawling_jobs?id=eq.{request.job_id}"
+
+            logger.info(f"🔄 BACKEND: Clearing completed_at via direct HTTP PATCH to {url}")
+            async with httpx.AsyncClient() as client:
+                patch_response = await client.patch(url, json=patch_data, headers=headers)
+                logger.info(f"   ✅ PATCH response status: {patch_response.status_code}")
+                if patch_response.status_code == 200:
+                    logger.info(f"   ✅ Successfully cleared completed_at")
+                else:
+                    logger.warning(f"   ⚠️  Failed to clear completed_at: {patch_response.text}")
+        else:
+            result = supabase.table('crawling_jobs').update(update_data).eq('id', request.job_id).execute()
 
         if not result.data:
-            logger.warning(f"Job {request.job_id} not found for status update")
+            logger.warning(f"⚠️  BACKEND: Job {request.job_id} not found for status update")
+        else:
+            logger.info(f"✅ BACKEND: Successfully updated job {request.job_id} status to {request.status}")
+            logger.info(f"   📊 Supabase response: {result.data}")
 
         logger.info(f"Updated job {request.job_id} status to {request.status}")
 
